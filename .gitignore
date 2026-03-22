@@ -11,3 +11,10 @@ __pycache__/
 04_knowledge_engine/vector_db/
 03_data_simulation/mock_images/
 03_data_simulation/mock_video/
+
+# 環境變數與機密資訊
+.env
+*.env
+.env.*
+secrets.json
+config.ini
