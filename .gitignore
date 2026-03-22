@@ -1,0 +1,13 @@
+# Python 虛擬環境
+.venv/
+__pycache__/
+*.pyc
+
+# 機器學習模型 (YOLO 等)
+02_models/yolo/*.pt
+*.onnx
+
+# 向量資料庫與測試資料
+04_knowledge_engine/vector_db/
+03_data_simulation/mock_images/
+03_data_simulation/mock_video/
