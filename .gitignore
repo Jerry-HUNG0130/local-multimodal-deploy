@@ -18,3 +18,7 @@ __pycache__/
 .env.*
 secrets.json
 config.ini
+
+# 日誌檔
+*.log
+hardware_log.csv

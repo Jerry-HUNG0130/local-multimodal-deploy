@@ -1,0 +1,7 @@
+langchain
+langchain_community
+chromadb
+ollama
+ultralytics
+opencv-python
+numpy
