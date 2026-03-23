@@ -22,3 +22,8 @@ config.ini
 # 日誌檔
 *.log
 hardware_log.csv
+
+# 字型、資料檔與圖片
+*.otf
+*.json
+*.png
