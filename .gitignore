@@ -27,3 +27,9 @@ hardware_log.csv
 *.otf
 *.json
 *.png
+
+# 評估結果
+07_evaluation_results/
+
+# Claude Code
+CLAUDE.md
