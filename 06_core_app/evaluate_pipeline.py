@@ -1,7 +1,7 @@
 import os
 import json
 import glob
-import requests
+import argparse
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
@@ -11,6 +11,10 @@ from dotenv import load_dotenv, find_dotenv
 from google import genai
 from google.genai import types
 from pydantic import BaseModel, Field
+
+from langchain_community.vectorstores import Chroma
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_community.llms import Ollama
 
 # -- Matplotlib Chinese Font --
 font_path = 'NotoSansTC.otf'
@@ -25,7 +29,8 @@ plt.rcParams['axes.unicode_minus'] = False
 # ============================================================
 # Config
 # ============================================================
-API_URL = "http://127.0.0.1:8000/api/chat"
+DB_DIR_V1 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db")
+DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v2")
 DATASET_FILE = "golden_dataset.json"
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results")
 
@@ -37,27 +42,138 @@ class EvaluationScore(BaseModel):
     reasoning: str = Field(description="Brief explanation of the scores given.")
 
 # ============================================================
-# Step 1: Generate Answers from Local RAG
+# Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
-def generate_answers(test_cases):
-    print("🤖 Step 1: 正在讓本地 RAG 模型進行作答...")
+def init_rag(k=3, db_version='v2'):
+    db_dir = DB_DIR_V1 if db_version == 'v1' else DB_DIR_V2
+    print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version})...")
+    embeddings = HuggingFaceEmbeddings(
+        model_name="BAAI/bge-m3",
+        model_kwargs={'device': 'cuda'}
+    )
+    vector_db = Chroma(persist_directory=db_dir, embedding_function=embeddings)
+    retriever = vector_db.as_retriever(search_kwargs={"k": k})
+    llm = Ollama(model="llama3", temperature=0.0)
+    print(f"✅ RAG 引擎就緒 (k={k}, db={db_version})\n")
+    return retriever, llm
+
+def _rewrite_keywords(llm, question):
+    """原始策略：將問題轉換為 3~5 個關鍵字"""
+    rewrite_prompt = (
+        "請將以下員工口語問題，轉換為 3 到 5 個用來搜尋公司規章的『正式關鍵字』。\n"
+        "【嚴格規定】：\n"
+        "1. 絕對只能使用「繁體中文」輸出，禁止出現任何英文。\n"
+        "2. 關鍵字之間請用空白鍵隔開即可，絕對不要使用項目符號(* 或 -)。\n"
+        "3. 不要加入任何解釋、問候或開場白。\n"
+        f"原始問題：'{question}'"
+    )
+    expanded_query = llm.invoke(rewrite_prompt).strip()
+    if ":" in expanded_query:
+        expanded_query = expanded_query.split(":")[-1].strip()
+    for noise in ["關鍵字", "正式", "搜尋", "是："]:
+        expanded_query = expanded_query.replace(noise, "")
+    return expanded_query.strip()
+
+
+def _rewrite_sentence(llm, question):
+    """方案 B：將口語問題改寫為一句完整的正式書面語句子，保留語義完整性"""
+    rewrite_prompt = (
+        "你是公司規章檢索系統的查詢優化器。\n"
+        "請將以下員工的口語問題，改寫為一句「完整的正式書面語句子」，用於搜尋公司內部規章。\n"
+        "【嚴格規定】：\n"
+        "1. 只輸出改寫後的一句話，不要加任何解釋或前綴。\n"
+        "2. 必須使用繁體中文。\n"
+        "3. 保留原始問題的完整語意，用正式的公司規章用語重新表達。\n"
+        "4. 不要拆成關鍵字，必須是一句完整、通順的句子。\n"
+        f"原始問題：'{question}'"
+    )
+    rewritten = llm.invoke(rewrite_prompt).strip()
+    # 清洗：移除可能的引號包裹或前綴
+    for prefix in ["改寫後：", "改寫：", "查詢：", "問題："]:
+        if rewritten.startswith(prefix):
+            rewritten = rewritten[len(prefix):].strip()
+    rewritten = rewritten.strip("「」『』\"'")
+    return rewritten
+
+
+def _retrieve_with_dedup(retriever, queries, k):
+    """對多組查詢進行檢索並去重，保留排序靠前的結果"""
+    seen_contents = set()
+    unique_docs = []
+    for q in queries:
+        docs = retriever.invoke(q)
+        for doc in docs:
+            content_key = doc.page_content.strip()
+            if content_key not in seen_contents:
+                seen_contents.add(content_key)
+                unique_docs.append(doc)
+    return unique_docs[:k]
+
+
+def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3):
+    # --- 根據 rewrite_mode 決定檢索查詢 ---
+    if rewrite_mode == 'sentence':
+        # 方案 B：改寫為完整書面語句子
+        search_query = _rewrite_sentence(llm, question)
+        print(f"  📝 [sentence] 改寫查詢：{search_query}")
+        retrieved_docs = retriever.invoke(search_query)
+        if not retrieved_docs:
+            retrieved_docs = retriever.invoke(question)
+
+    elif rewrite_mode == 'dual':
+        # 方案 C：原始問題 + 書面語改寫，雙路檢索合併去重
+        rewritten = _rewrite_sentence(llm, question)
+        print(f"  📝 [dual] 改寫查詢：{rewritten}")
+        # 雙路檢索：各取 k 筆，合併去重後取前 k 筆
+        retrieved_docs = _retrieve_with_dedup(retriever, [question, rewritten], k)
+
+    else:
+        # 原始策略：關鍵字模式
+        expanded_query = _rewrite_keywords(llm, question)
+        print(f"  📝 [keywords] 擴寫關鍵字：{expanded_query}")
+        retrieved_docs = retriever.invoke(expanded_query)
+        if not retrieved_docs:
+            retrieved_docs = retriever.invoke(question)
+
+    context = "\n\n".join([d.page_content for d in retrieved_docs])
+
+    prompt = f"""你是公司內部規章查詢系統。
+
+【回答規則】
+1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
+2. 回答必須簡潔扼要，直接給出答案，不要加客套話或問候語。
+3. 只有當參考資料中「完全沒有」任何相關內容時，才回答「規章未說明」。
+4. 嚴禁添加參考資料中沒有提到的內容，不要自行編造數字或規定。
+5. 回答必須使用繁體中文。
+
+【參考資料】
+{context}
+
+【員工提問】
+{question}
+
+【你的回答】
+"""
+    answer = llm.invoke(prompt)
+    return answer, context
+
+def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3):
+    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode})...")
     results = []
 
     for i, case in enumerate(test_cases):
         q = case["question"]
         print(f"  [{i+1}/{len(test_cases)}] {q}")
         try:
-            response = requests.post(API_URL, json={"question": q}, timeout=60)
-            response.raise_for_status()
-            data = response.json()
+            answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k)
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],
-                "answer": data.get("answer", ""),
-                "context": data.get("context_used", "")
+                "answer": answer,
+                "context": context
             })
         except Exception as e:
-            print(f"  ❌ API 呼叫失敗: {e}")
+            print(f"  ❌ 作答失敗: {e}")
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],
@@ -284,30 +400,20 @@ def generate_visual_report(df, output_path="rag_evaluation_report.png", run_labe
     print(f"✅ 視覺化圖表已儲存：{output_path}")
 
 # ============================================================
-# Main Pipeline
+# Single Run Pipeline
 # ============================================================
-def main():
-    run_label = os.environ.get("RUN_LABEL", "baseline")
+def run_single(test_cases, k, run_label, db_version='v2', rewrite_mode='keywords'):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    # Load golden dataset
-    if not os.path.exists(DATASET_FILE):
-        print(f"❌ 找不到 {DATASET_FILE}！")
-        return
-    with open(DATASET_FILE, "r", encoding="utf-8") as f:
-        test_cases = json.load(f)
-    print(f"📋 載入 {len(test_cases)} 題測試資料\n")
+    retriever, llm = init_rag(k=k, db_version=db_version)
+    answer_results = generate_answers(test_cases, retriever, llm, rewrite_mode=rewrite_mode, k=k)
 
-    # Step 1: Generate answers
-    answer_results = generate_answers(test_cases)
-
-    # Step 2: Evaluate with Gemini
     df = evaluate_answers(answer_results)
     if df is None:
-        return
+        return None
 
     # Print score summary
-    print("📊 【RAG 系統評估成績單】")
+    print(f"📊 【{run_label} 評估成績單】")
     metrics = ['context_precision', 'context_recall', 'faithfulness', 'answer_relevancy']
     display_df = df[['question'] + metrics]
     print(display_df.to_markdown(index=False))
@@ -318,9 +424,65 @@ def main():
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"\n💾 評分數據已儲存：{csv_path}")
 
-    # Step 3: Generate visual report
     png_path = os.path.join(RESULTS_DIR, f"{run_label}_{timestamp}.png")
     generate_visual_report(df, output_path=png_path, run_label=run_label)
+
+    return {
+        'run_label': run_label,
+        'k': k,
+        'csv_path': csv_path,
+        'png_path': png_path,
+        'avg': {m: df[m].mean() for m in metrics}
+    }
+
+# ============================================================
+# Main
+# ============================================================
+def main():
+    parser = argparse.ArgumentParser(description="RAG Evaluation Pipeline")
+    parser.add_argument('--k', type=int, nargs='+', default=[7],
+                        help='Retriever k values to test (e.g. --k 5 7 10)')
+    parser.add_argument('--db', type=str, default='v2', choices=['v1', 'v2'],
+                        help='Vector DB version (v1=chunk500, v2=MarkdownHeader)')
+    parser.add_argument('--rewrite', type=str, nargs='+', default=['keywords'],
+                        choices=['keywords', 'sentence', 'dual'],
+                        help='Query rewrite strategy (keywords=原始關鍵字, sentence=完整書面語改寫, dual=雙路檢索合併)')
+    args = parser.parse_args()
+
+    if not os.path.exists(DATASET_FILE):
+        print(f"❌ 找不到 {DATASET_FILE}！")
+        return
+    with open(DATASET_FILE, "r", encoding="utf-8") as f:
+        test_cases = json.load(f)
+    print(f"📋 載入 {len(test_cases)} 題測試資料")
+    print(f"🔬 預計測試 k 值：{args.k}, DB 版本：{args.db}, Rewrite 策略：{args.rewrite}\n")
+    print("=" * 60)
+
+    all_results = []
+    for rewrite_mode in args.rewrite:
+        for k in args.k:
+            run_label = f"db{args.db}_k{k}_rw-{rewrite_mode}"
+            print(f"\n{'=' * 60}")
+            print(f"  開始測試：k = {k}, db = {args.db}, rewrite = {rewrite_mode}")
+            print(f"{'=' * 60}\n")
+            result = run_single(test_cases, k, run_label, db_version=args.db, rewrite_mode=rewrite_mode)
+            if result:
+                result['rewrite_mode'] = rewrite_mode
+                all_results.append(result)
+
+    # Print comparison summary
+    if len(all_results) > 1:
+        metrics = ['context_precision', 'context_recall', 'faithfulness', 'answer_relevancy']
+        print(f"\n{'=' * 60}")
+        print("📊 【跨策略比較總表】")
+        print(f"{'=' * 60}")
+        header = f"{'config':<25}" + "".join(f"{m:<22}" for m in metrics)
+        print(header)
+        print("-" * len(header))
+        for r in all_results:
+            label = f"k={r['k']} rw={r.get('rewrite_mode', 'keywords')}"
+            row = f"{label:<25}" + "".join(f"{r['avg'][m]:<22.4f}" for m in metrics)
+            print(row)
 
 if __name__ == "__main__":
     main()

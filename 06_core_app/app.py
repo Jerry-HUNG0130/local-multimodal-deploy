@@ -13,7 +13,7 @@ app = FastAPI()
 
 # 絕對遵循不連外網的安全限制
 # 假設 app.py 放在專案根目錄，指向 04_knowledge_engine/vector_db
-DB_DIR = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db")
+DB_DIR = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v2")
 STATIC_DIR = os.path.join(os.path.dirname(__file__), "static")
 
 # 1. 載入我們稍早用 BGE-M3 生產好的本地向量資料庫
@@ -89,18 +89,22 @@ async def chat_with_rag(req: ChatRequest):
     context = "\n\n".join([d.page_content for d in retrieved_docs])
     
     # 步驟二：拼裝為給 AI 閱讀的完美 Prompt
-    prompt = f"""你是公司資深的「機房維運主任兼人資副理」。
-請你「嚴格」根據以下提供的【公司規章內容】來回答員工提出的問題。
-如果參考規章中沒有提到該問題的答案，請直接回答「根據目前系統內的規章，無法找到相關規定」。
-請用繁體中文回答，口吻專業且簡潔。
+    prompt = f"""你是公司內部規章查詢系統。
 
-【公司規章內容摘錄如下】：
+【回答規則】
+1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
+2. 回答必須簡潔扼要，直接給出答案，不要加客套話或問候語。
+3. 只有當參考資料中「完全沒有」任何相關內容時，才回答「規章未說明」。
+4. 嚴禁添加參考資料中沒有提到的內容，不要自行編造數字或規定。
+5. 回答必須使用繁體中文。
+
+【參考資料】
 {context}
 
-【員工提出的問題】：
+【員工提問】
 {question}
 
-請根據上述指引提供您的專業回覆：
+【你的回答】
 """
 
     # 步驟三：讓 AI 思考並產生回答
