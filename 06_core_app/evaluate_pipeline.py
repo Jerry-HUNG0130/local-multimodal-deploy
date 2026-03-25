@@ -2,14 +2,16 @@ import os
 import json
 import glob
 import argparse
+import subprocess
+import time
+import threading
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
 import matplotlib.font_manager as fm
 from datetime import datetime
 from dotenv import load_dotenv, find_dotenv
-from google import genai
-from google.genai import types
+import anthropic
 from pydantic import BaseModel, Field
 
 from langchain_community.vectorstores import Chroma
@@ -32,7 +34,8 @@ plt.rcParams['axes.unicode_minus'] = False
 DB_DIR_V1 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db")
 DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v2")
 DATASET_FILE = "golden_dataset.json"
-RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results")
+RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "scores")
+HARDWARE_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "hardware")
 
 class EvaluationScore(BaseModel):
     context_precision: float = Field(description="Score between 0.0 and 1.0. Is the retrieved context relevant to the question?")
@@ -40,6 +43,106 @@ class EvaluationScore(BaseModel):
     faithfulness: float = Field(description="Score between 0.0 and 1.0. Is the model's answer factually derived from the retrieved context (no hallucination)?")
     answer_relevancy: float = Field(description="Score between 0.0 and 1.0. How well does the answer address the question directly?")
     reasoning: str = Field(description="Brief explanation of the scores given.")
+
+# ============================================================
+# Hardware Monitor
+# ============================================================
+def _sample_hardware():
+    """取得當前硬體使用狀態（CPU%, RAM MB, GPU Util%, GPU Mem MB）"""
+    snapshot = {"timestamp": datetime.now().isoformat()}
+    try:
+        import psutil
+        snapshot["cpu_percent"] = psutil.cpu_percent(interval=0.1)
+        mem = psutil.virtual_memory()
+        snapshot["ram_used_mb"] = round(mem.used / 1024 / 1024)
+        snapshot["ram_total_mb"] = round(mem.total / 1024 / 1024)
+    except ImportError:
+        # fallback: read from /proc
+        with open("/proc/meminfo", "r") as f:
+            lines = f.readlines()
+        meminfo = {}
+        for line in lines:
+            parts = line.split()
+            meminfo[parts[0].rstrip(":")] = int(parts[1])
+        total_mb = meminfo["MemTotal"] // 1024
+        avail_mb = meminfo["MemAvailable"] // 1024
+        snapshot["ram_used_mb"] = total_mb - avail_mb
+        snapshot["ram_total_mb"] = total_mb
+        snapshot["cpu_percent"] = None
+
+    try:
+        result = subprocess.run(
+            ["nvidia-smi", "--query-gpu=utilization.gpu,memory.used,memory.total",
+             "--format=csv,noheader,nounits"],
+            capture_output=True, text=True, timeout=5
+        )
+        if result.returncode == 0:
+            parts = result.stdout.strip().split(",")
+            snapshot["gpu_util_percent"] = int(parts[0].strip())
+            snapshot["gpu_mem_used_mb"] = int(parts[1].strip())
+            snapshot["gpu_mem_total_mb"] = int(parts[2].strip())
+    except Exception:
+        pass
+
+    return snapshot
+
+
+class HardwareMonitor:
+    """背景執行緒定期採樣硬體數據，在測試結束後彙整摘要"""
+
+    def __init__(self, interval=5):
+        self.interval = interval
+        self.samples = []
+        self._stop_event = threading.Event()
+        self._thread = None
+
+    def start(self):
+        self._stop_event.clear()
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        print(f"📡 硬體監控已啟動（每 {self.interval} 秒採樣）")
+
+    def _run(self):
+        while not self._stop_event.is_set():
+            self.samples.append(_sample_hardware())
+            self._stop_event.wait(self.interval)
+
+    def stop(self):
+        self._stop_event.set()
+        if self._thread:
+            self._thread.join(timeout=10)
+        # 最後再採一次
+        self.samples.append(_sample_hardware())
+        print(f"📡 硬體監控已停止，共 {len(self.samples)} 筆採樣")
+
+    def summary(self):
+        """彙整硬體使用摘要"""
+        if not self.samples:
+            return {}
+        gpu_utils = [s["gpu_util_percent"] for s in self.samples if "gpu_util_percent" in s]
+        gpu_mems = [s["gpu_mem_used_mb"] for s in self.samples if "gpu_mem_used_mb" in s]
+        ram_used = [s["ram_used_mb"] for s in self.samples if "ram_used_mb" in s]
+        cpu_pcts = [s["cpu_percent"] for s in self.samples if s.get("cpu_percent") is not None]
+
+        summary = {
+            "sample_count": len(self.samples),
+            "ram_total_mb": self.samples[0].get("ram_total_mb"),
+            "gpu_mem_total_mb": self.samples[0].get("gpu_mem_total_mb"),
+        }
+        if gpu_utils:
+            summary["gpu_util_avg"] = round(np.mean(gpu_utils), 1)
+            summary["gpu_util_max"] = max(gpu_utils)
+        if gpu_mems:
+            summary["gpu_mem_used_avg_mb"] = round(np.mean(gpu_mems))
+            summary["gpu_mem_used_max_mb"] = max(gpu_mems)
+        if ram_used:
+            summary["ram_used_avg_mb"] = round(np.mean(ram_used))
+            summary["ram_used_max_mb"] = max(ram_used)
+        if cpu_pcts:
+            summary["cpu_percent_avg"] = round(np.mean(cpu_pcts), 1)
+            summary["cpu_percent_max"] = round(max(cpu_pcts), 1)
+        return summary
+
 
 # ============================================================
 # Step 1: Generate Answers from Local RAG (Direct Call)
@@ -110,7 +213,24 @@ def _retrieve_with_dedup(retriever, queries, k):
     return unique_docs[:k]
 
 
-def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3):
+def _rerank(reranker, question, docs, top_k=3):
+    """使用 CrossEncoder 對檢索結果重新排序"""
+    if not docs:
+        return docs
+    pairs = [[question, doc.page_content] for doc in docs]
+    scores = reranker.predict(pairs)
+    scored_docs = sorted(zip(scores, docs), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in scored_docs[:top_k]]
+
+
+def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=None):
+    # 如果有 reranker，先多撈一些候選文件再重排
+    fetch_k = k * 3 if reranker else k
+
+    # 臨時調整 retriever 的 k 值
+    original_k = retriever.search_kwargs.get("k", k)
+    retriever.search_kwargs["k"] = fetch_k
+
     # --- 根據 rewrite_mode 決定檢索查詢 ---
     if rewrite_mode == 'sentence':
         # 方案 B：改寫為完整書面語句子
@@ -135,6 +255,14 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3):
         if not retrieved_docs:
             retrieved_docs = retriever.invoke(question)
 
+    # 還原 retriever k 值
+    retriever.search_kwargs["k"] = original_k
+
+    # --- Reranker 重排（如果有提供）---
+    if reranker is not None:
+        print(f"  🔄 [reranker] 重排 {len(retrieved_docs)} → top {k}")
+        retrieved_docs = _rerank(reranker, question, retrieved_docs, top_k=k)
+
     context = "\n\n".join([d.page_content for d in retrieved_docs])
 
     prompt = f"""你是公司內部規章查詢系統。
@@ -157,15 +285,16 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3):
     answer = llm.invoke(prompt)
     return answer, context
 
-def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3):
-    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode})...")
+def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, reranker=None):
+    reranker_label = "+ reranker" if reranker else ""
+    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label})...")
     results = []
 
     for i, case in enumerate(test_cases):
         q = case["question"]
         print(f"  [{i+1}/{len(test_cases)}] {q}")
         try:
-            answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k)
+            answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k, reranker=reranker)
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],
@@ -196,9 +325,8 @@ def load_regulations(lib_dir="../01_docs_library"):
             regulations.append(f"--- File: {filename} ---\n{content}\n")
     return "\n".join(regulations)
 
-def evaluate_with_gemini(client, regulations, case):
-    prompt = f"""
-You are a strict and professional evaluator for a RAG (Retrieval-Augmented Generation) system.
+def evaluate_with_claude(client, regulations, case):
+    prompt = f"""You are a strict and professional evaluator for a RAG (Retrieval-Augmented Generation) system.
 You will evaluate the system's performance on a specific question based on company regulations.
 
 ### Company Regulations:
@@ -213,37 +341,43 @@ Model's Answer: {case['answer']}
 ### Instructions:
 Evaluate the model's answer based on the retrieved context and ground truth. Output 4 metric scores (0.0 to 1.0) and a brief reasoning in traditional Chinese.
 Be extremely strict. If the answer contradicts the regulations or ground truth, scores should be low.
-"""
-    response = client.models.generate_content(
-        model='gemini-2.5-flash',
-        contents=prompt,
-        config=types.GenerateContentConfig(
-            response_mime_type="application/json",
-            response_schema=EvaluationScore,
-            temperature=0.0,
-        ),
+
+You MUST respond with ONLY a valid JSON object in the following format, no other text:
+{{
+  "context_precision": <float 0.0-1.0>,
+  "context_recall": <float 0.0-1.0>,
+  "faithfulness": <float 0.0-1.0>,
+  "answer_relevancy": <float 0.0-1.0>,
+  "reasoning": "<brief explanation in traditional Chinese>"
+}}"""
+
+    response = client.messages.create(
+        model="claude-sonnet-4-20250514",
+        max_tokens=512,
+        temperature=0.0,
+        messages=[{"role": "user", "content": prompt}]
     )
-    return response.text
+    return response.content[0].text
 
 def evaluate_answers(answer_results):
     load_dotenv(find_dotenv())
-    api_key = os.environ.get("GOOGLE_API_KEY")
+    api_key = os.environ.get("ANTHROPIC_API_KEY")
     if not api_key:
-        print("❌ 錯誤：找不到 GOOGLE_API_KEY，請確認 .env 檔案設定！")
+        print("❌ 錯誤：找不到 ANTHROPIC_API_KEY，請確認 .env 檔案設定！")
         return None
 
-    client = genai.Client(api_key=api_key)
+    client = anthropic.Anthropic(api_key=api_key)
 
     print("📖 正在載入公司規章...")
     regulations_text = load_regulations()
 
-    print("👨‍🏫 Step 2: 正在呼叫 Gemini 2.5 Flash 進行嚴格閱卷...")
+    print("👨‍🏫 Step 2: 正在呼叫 Claude Sonnet 進行嚴格閱卷...")
     evaluated_results = []
 
     for i, case in enumerate(answer_results):
         print(f"  [{i+1}/{len(answer_results)}] {case['question']}")
         try:
-            result_json = evaluate_with_gemini(client, regulations_text, case)
+            result_json = evaluate_with_claude(client, regulations_text, case)
             score_data = json.loads(result_json)
             combined = {**case, **score_data}
             evaluated_results.append(combined)
@@ -405,10 +539,24 @@ def generate_visual_report(df, output_path="rag_evaluation_report.png", run_labe
 def run_single(test_cases, k, run_label, db_version='v2', rewrite_mode='keywords'):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
 
-    retriever, llm = init_rag(k=k, db_version=db_version)
-    answer_results = generate_answers(test_cases, retriever, llm, rewrite_mode=rewrite_mode, k=k)
+    # 啟動硬體監控
+    hw_monitor = HardwareMonitor(interval=5)
+    hw_monitor.start()
+    run_start = time.time()
 
+    retriever, llm = init_rag(k=k, db_version=db_version)
+
+    inference_start = time.time()
+    answer_results = generate_answers(test_cases, retriever, llm, rewrite_mode=rewrite_mode, k=k)
+    inference_duration = time.time() - inference_start
+
+    eval_start = time.time()
     df = evaluate_answers(answer_results)
+    eval_duration = time.time() - eval_start
+
+    total_duration = time.time() - run_start
+    hw_monitor.stop()
+
     if df is None:
         return None
 
@@ -420,19 +568,73 @@ def run_single(test_cases, k, run_label, db_version='v2', rewrite_mode='keywords
 
     # Save results
     os.makedirs(RESULTS_DIR, exist_ok=True)
+    os.makedirs(HARDWARE_DIR, exist_ok=True)
+
     csv_path = os.path.join(RESULTS_DIR, f"{run_label}_{timestamp}.csv")
     df.to_csv(csv_path, index=False, encoding='utf-8-sig')
     print(f"\n💾 評分數據已儲存：{csv_path}")
 
+    # Save model answers as JSON for cross-round comparison
+    answers_json = []
+    for r in answer_results:
+        answers_json.append({
+            "question": r["question"],
+            "ground_truth": r["ground_truth"],
+            "answer": r["answer"],
+            "context": r["context"]
+        })
+    json_path = os.path.join(RESULTS_DIR, f"{run_label}_{timestamp}_answers.json")
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(answers_json, f, ensure_ascii=False, indent=2)
+    print(f"💾 模型回答已儲存：{json_path}")
+
     png_path = os.path.join(RESULTS_DIR, f"{run_label}_{timestamp}.png")
     generate_visual_report(df, output_path=png_path, run_label=run_label)
+
+    # Save hardware report
+    hw_summary = hw_monitor.summary()
+    hw_report = {
+        "run_label": run_label,
+        "timestamp": timestamp,
+        "config": {
+            "db_version": db_version,
+            "k": k,
+            "rewrite_mode": rewrite_mode,
+            "num_questions": len(test_cases)
+        },
+        "timing": {
+            "total_seconds": round(total_duration, 1),
+            "inference_seconds": round(inference_duration, 1),
+            "evaluation_seconds": round(eval_duration, 1),
+            "avg_inference_per_question": round(inference_duration / len(test_cases), 2)
+        },
+        "hardware": hw_summary,
+        "samples": hw_monitor.samples
+    }
+    hw_path = os.path.join(HARDWARE_DIR, f"{run_label}_{timestamp}_hardware.json")
+    with open(hw_path, "w", encoding="utf-8") as f:
+        json.dump(hw_report, f, ensure_ascii=False, indent=2)
+    print(f"💾 硬體監控報告已儲存：{hw_path}")
+
+    # Print hardware summary
+    print(f"\n⚙️  【硬體耗用摘要】")
+    print(f"  總耗時：{total_duration:.0f}s（推論 {inference_duration:.0f}s + 評測 {eval_duration:.0f}s）")
+    print(f"  平均每題推論：{inference_duration / len(test_cases):.1f}s")
+    if "gpu_util_avg" in hw_summary:
+        print(f"  GPU 使用率：平均 {hw_summary['gpu_util_avg']}% / 峰值 {hw_summary['gpu_util_max']}%")
+    if "gpu_mem_used_max_mb" in hw_summary:
+        print(f"  GPU 記憶體：平均 {hw_summary['gpu_mem_used_avg_mb']}MB / 峰值 {hw_summary['gpu_mem_used_max_mb']}MB (共 {hw_summary.get('gpu_mem_total_mb', '?')}MB)")
+    if "ram_used_max_mb" in hw_summary:
+        print(f"  系統記憶體：平均 {hw_summary['ram_used_avg_mb']}MB / 峰值 {hw_summary['ram_used_max_mb']}MB (共 {hw_summary.get('ram_total_mb', '?')}MB)")
 
     return {
         'run_label': run_label,
         'k': k,
         'csv_path': csv_path,
         'png_path': png_path,
-        'avg': {m: df[m].mean() for m in metrics}
+        'avg': {m: df[m].mean() for m in metrics},
+        'timing': hw_report['timing'],
+        'hardware': hw_summary
     }
 
 # ============================================================
@@ -447,6 +649,10 @@ def main():
     parser.add_argument('--rewrite', type=str, nargs='+', default=['keywords'],
                         choices=['keywords', 'sentence', 'dual'],
                         help='Query rewrite strategy (keywords=原始關鍵字, sentence=完整書面語改寫, dual=雙路檢索合併)')
+    parser.add_argument('--judge', type=str, default='claude',
+                        help='評測模型標籤，用於檔名識別 (e.g. claude, gemini)')
+    parser.add_argument('--tag', type=str, default=None,
+                        help='額外標記，附加在檔名中用於識別特殊改動 (e.g. strict-prompt, reranker)')
     args = parser.parse_args()
 
     if not os.path.exists(DATASET_FILE):
@@ -461,7 +667,8 @@ def main():
     all_results = []
     for rewrite_mode in args.rewrite:
         for k in args.k:
-            run_label = f"db{args.db}_k{k}_rw-{rewrite_mode}"
+            tag_suffix = f"_{args.tag}" if args.tag else ""
+            run_label = f"db{args.db}_k{k}_rw-{rewrite_mode}_j-{args.judge}{tag_suffix}"
             print(f"\n{'=' * 60}")
             print(f"  開始測試：k = {k}, db = {args.db}, rewrite = {rewrite_mode}")
             print(f"{'=' * 60}\n")
@@ -473,15 +680,17 @@ def main():
     # Print comparison summary
     if len(all_results) > 1:
         metrics = ['context_precision', 'context_recall', 'faithfulness', 'answer_relevancy']
-        print(f"\n{'=' * 60}")
+        print(f"\n{'=' * 80}")
         print("📊 【跨策略比較總表】")
-        print(f"{'=' * 60}")
-        header = f"{'config':<25}" + "".join(f"{m:<22}" for m in metrics)
+        print(f"{'=' * 80}")
+        header = f"{'config':<25}" + "".join(f"{m:<18}" for m in metrics) + f"{'推論(s)':<10}{'GPU峰值(MB)':<12}"
         print(header)
         print("-" * len(header))
         for r in all_results:
             label = f"k={r['k']} rw={r.get('rewrite_mode', 'keywords')}"
-            row = f"{label:<25}" + "".join(f"{r['avg'][m]:<22.4f}" for m in metrics)
+            row = f"{label:<25}" + "".join(f"{r['avg'][m]:<18.4f}" for m in metrics)
+            row += f"{r.get('timing', {}).get('inference_seconds', '-'):<10}"
+            row += f"{r.get('hardware', {}).get('gpu_mem_used_max_mb', '-'):<12}"
             print(row)
 
 if __name__ == "__main__":

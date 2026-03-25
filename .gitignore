@@ -9,6 +9,8 @@ __pycache__/
 
 # 向量資料庫與測試資料
 04_knowledge_engine/vector_db/
+04_knowledge_engine/vector_db_v2/
+04_knowledge_engine/vector_db_v1_mxbai/
 03_data_simulation/mock_images/
 03_data_simulation/mock_video/
 
