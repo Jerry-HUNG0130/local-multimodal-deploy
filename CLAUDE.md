@@ -10,6 +10,10 @@ Interview portfolio project. Demonstrates the ability to deploy, evaluate, and i
 - Iteratively improves results through prompt engineering, data formatting, retrieval tuning, etc.
 - Each improvement round is saved in `07_evaluation_results/` for side-by-side comparison
 
+## Git 規範
+- **嚴禁在 commit message 中加入 `Co-Authored-By: Claude` 或任何 Claude 相關的署名。** GitHub 上的創作者必須只有用戶本人。
+- commit message 格式：`[Add]/[Fix]/[Improve]/[Refactor] 簡述改動內容`，不加任何 AI 署名。
+
 ## Development Environment
 - **Virtual Environment**: This project uses `.venv`. Always activate it before running commands (`source .venv/bin/activate`). NEVER install packages globally — always use `pip install` inside the `.venv` environment.
 - **Security**: 安裝 `litellm` 時必須避開 1.82.7 和 1.82.8 版本（已知資安漏洞）。
