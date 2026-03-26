@@ -18,6 +18,10 @@ from langchain_community.vectorstores import Chroma
 from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_community.llms import Ollama
 
+# BM25 Hybrid Search
+import jieba
+from rank_bm25 import BM25Okapi
+
 # -- Matplotlib Chinese Font --
 font_path = 'NotoSansTC.otf'
 if os.path.exists(font_path):
@@ -33,6 +37,8 @@ plt.rcParams['axes.unicode_minus'] = False
 # ============================================================
 DB_DIR_V1 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db")
 DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v2")
+DB_DIR_V3 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v3")
+DB_DIR_V4 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v4")
 DATASET_FILE = "golden_dataset.json"
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "scores")
 HARDWARE_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "hardware")
@@ -148,7 +154,8 @@ class HardwareMonitor:
 # Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
 def init_rag(k=3, db_version='v2'):
-    db_dir = DB_DIR_V1 if db_version == 'v1' else DB_DIR_V2
+    db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4}
+    db_dir = db_map.get(db_version, DB_DIR_V2)
     print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version})...")
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
@@ -223,45 +230,181 @@ def _rerank(reranker, question, docs, top_k=3):
     return [doc for _, doc in scored_docs[:top_k]]
 
 
-def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=None):
+# ============================================================
+# BM25 Hybrid Search
+# ============================================================
+def _tokenize_chinese(text):
+    """用 jieba 對中文文本進行分詞，過濾空白和標點"""
+    tokens = jieba.lcut(text)
+    # 過濾空白、標點、單字元符號
+    return [t for t in tokens if t.strip() and len(t.strip()) > 0
+            and not all(c in '，。、；：「」（）！？\n\r\t ' for c in t)]
+
+
+def build_bm25_index(vector_db):
+    """從 ChromaDB 取出所有文件，建立 BM25 索引"""
+    collection = vector_db._collection
+    all_data = collection.get(include=["documents", "metadatas"])
+
+    docs_with_meta = []
+    tokenized_corpus = []
+    for doc_text, meta in zip(all_data["documents"], all_data["metadatas"]):
+        docs_with_meta.append({"page_content": doc_text, "metadata": meta or {}})
+        tokenized_corpus.append(_tokenize_chinese(doc_text))
+
+    bm25_index = BM25Okapi(tokenized_corpus)
+    print(f"📚 BM25 索引建立完成（{len(tokenized_corpus)} 個 chunks）")
+    return bm25_index, docs_with_meta
+
+
+def _bm25_search(bm25_index, docs_with_meta, query, top_k=9):
+    """用 BM25 對查詢進行關鍵字檢索"""
+    from langchain_core.documents import Document
+    tokenized_query = _tokenize_chinese(query)
+    scores = bm25_index.get_scores(tokenized_query)
+    top_indices = np.argsort(scores)[::-1][:top_k]
+
+    results = []
+    for idx in top_indices:
+        if scores[idx] > 0:  # 只保留有匹配的結果
+            doc_info = docs_with_meta[idx]
+            doc = Document(
+                page_content=doc_info["page_content"],
+                metadata=doc_info["metadata"]
+            )
+            results.append((doc, scores[idx]))
+    return results
+
+
+def _hyde_generate(llm, question):
+    """HyDE: 讓 LLM 產生假設性的規章回答，用於改善 vector search 的語義匹配"""
+    hyde_prompt = (
+        "你是公司內部規章查詢系統。請根據以下員工提問，假設你知道答案，"
+        "用正式的公司規章語氣寫出一段可能的回答（約 50-100 字）。\n"
+        "即使你不確定答案，也請用合理的規章格式和用語撰寫。\n"
+        "必須使用繁體中文，不要加任何前綴或解釋。\n\n"
+        f"員工提問：'{question}'"
+    )
+    hypothetical = llm.invoke(hyde_prompt).strip()
+    # 清洗：移除可能的前綴
+    for prefix in ["回答：", "答：", "根據公司規章，"]:
+        if hypothetical.startswith(prefix):
+            hypothetical = hypothetical[len(prefix):].strip()
+    return hypothetical
+
+
+def _hybrid_retrieve(retriever, bm25_index, docs_with_meta, query, fetch_k=9, rrf_k=60,
+                     vector_query=None):
+    """
+    Hybrid Search: Vector + BM25，使用 Reciprocal Rank Fusion (RRF) 合併
+    RRF score = sum(1 / (rrf_k + rank_i)) for each retrieval source
+    vector_query: 若提供，vector search 用此查詢（HyDE 場景），BM25 仍用 query
+    """
+    from langchain_core.documents import Document
+
+    # Vector search（可用不同的查詢，如 HyDE 假設性回答）
+    vec_q = vector_query if vector_query else query
+    original_k = retriever.search_kwargs.get("k", fetch_k)
+    retriever.search_kwargs["k"] = fetch_k
+    vector_docs = retriever.invoke(vec_q)
+    retriever.search_kwargs["k"] = original_k
+
+    # BM25 search（始終用原始查詢，關鍵字匹配更適合）
+    bm25_results = _bm25_search(bm25_index, docs_with_meta, query, top_k=fetch_k)
+
+    # RRF 合併：用 page_content 作為去重 key
+    rrf_scores = {}  # content -> (score, doc)
+
+    for rank, doc in enumerate(vector_docs):
+        key = doc.page_content.strip()
+        score = 1.0 / (rrf_k + rank + 1)
+        if key in rrf_scores:
+            rrf_scores[key] = (rrf_scores[key][0] + score, rrf_scores[key][1])
+        else:
+            rrf_scores[key] = (score, doc)
+
+    for rank, (doc, _bm25_score) in enumerate(bm25_results):
+        key = doc.page_content.strip()
+        score = 1.0 / (rrf_k + rank + 1)
+        if key in rrf_scores:
+            rrf_scores[key] = (rrf_scores[key][0] + score, rrf_scores[key][1])
+        else:
+            rrf_scores[key] = (score, doc)
+
+    # 按 RRF 分數降序排列
+    sorted_results = sorted(rrf_scores.values(), key=lambda x: x[0], reverse=True)
+    return [doc for _, doc in sorted_results]
+
+
+def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=None,
+              bm25_index=None, bm25_docs=None, use_hyde=False):
     # 如果有 reranker，先多撈一些候選文件再重排
     fetch_k = k * 3 if reranker else k
+    use_hybrid = bm25_index is not None and bm25_docs is not None
 
-    # 臨時調整 retriever 的 k 值
-    original_k = retriever.search_kwargs.get("k", k)
-    retriever.search_kwargs["k"] = fetch_k
-
-    # --- 根據 rewrite_mode 決定檢索查詢 ---
+    # --- 根據 rewrite_mode 決定搜尋查詢 ---
     if rewrite_mode == 'sentence':
-        # 方案 B：改寫為完整書面語句子
         search_query = _rewrite_sentence(llm, question)
         print(f"  📝 [sentence] 改寫查詢：{search_query}")
-        retrieved_docs = retriever.invoke(search_query)
-        if not retrieved_docs:
-            retrieved_docs = retriever.invoke(question)
-
     elif rewrite_mode == 'dual':
-        # 方案 C：原始問題 + 書面語改寫，雙路檢索合併去重
-        rewritten = _rewrite_sentence(llm, question)
-        print(f"  📝 [dual] 改寫查詢：{rewritten}")
-        # 雙路檢索：各取 k 筆，合併去重後取前 k 筆
-        retrieved_docs = _retrieve_with_dedup(retriever, [question, rewritten], k)
-
+        search_query = _rewrite_sentence(llm, question)
+        print(f"  📝 [dual] 改寫查詢：{search_query}")
     else:
-        # 原始策略：關鍵字模式
-        expanded_query = _rewrite_keywords(llm, question)
-        print(f"  📝 [keywords] 擴寫關鍵字：{expanded_query}")
-        retrieved_docs = retriever.invoke(expanded_query)
-        if not retrieved_docs:
-            retrieved_docs = retriever.invoke(question)
+        search_query = _rewrite_keywords(llm, question)
+        print(f"  📝 [keywords] 擴寫關鍵字：{search_query}")
 
-    # 還原 retriever k 值
-    retriever.search_kwargs["k"] = original_k
+    # --- HyDE: 產生假設性回答用於 vector search ---
+    hyde_query = None
+    if use_hyde:
+        hyde_query = _hyde_generate(llm, question)
+        print(f"  🔮 [HyDE] 假設性回答：{hyde_query[:80]}...")
+
+    # --- 檢索 ---
+    if use_hybrid:
+        # Hybrid Search: Vector + BM25 → RRF 合併
+        print(f"  🔀 [hybrid] Vector + BM25 → RRF 合併 (fetch_k={fetch_k})")
+        if rewrite_mode == 'dual':
+            hybrid_docs_1 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, question,
+                                             fetch_k=fetch_k, vector_query=hyde_query)
+            hybrid_docs_2 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
+                                             fetch_k=fetch_k, vector_query=hyde_query)
+            seen = set()
+            retrieved_docs = []
+            for doc in hybrid_docs_1 + hybrid_docs_2:
+                key = doc.page_content.strip()
+                if key not in seen:
+                    seen.add(key)
+                    retrieved_docs.append(doc)
+            retrieved_docs = retrieved_docs[:fetch_k]
+        else:
+            # HyDE: vector search 用假設性回答，BM25 用 sentence rewrite 查詢
+            retrieved_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
+                                             fetch_k=fetch_k, vector_query=hyde_query)
+            if not retrieved_docs:
+                retrieved_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, question,
+                                                 fetch_k=fetch_k, vector_query=hyde_query)
+        retrieved_docs = retrieved_docs[:fetch_k]
+    else:
+        # 純 Vector Search（原有邏輯）
+        original_k = retriever.search_kwargs.get("k", k)
+        retriever.search_kwargs["k"] = fetch_k
+
+        vec_q = hyde_query if hyde_query else search_query
+        if rewrite_mode == 'dual':
+            retrieved_docs = _retrieve_with_dedup(retriever, [question, vec_q], fetch_k)
+        else:
+            retrieved_docs = retriever.invoke(vec_q)
+            if not retrieved_docs:
+                retrieved_docs = retriever.invoke(question)
+
+        retriever.search_kwargs["k"] = original_k
 
     # --- Reranker 重排（如果有提供）---
     if reranker is not None:
         print(f"  🔄 [reranker] 重排 {len(retrieved_docs)} → top {k}")
         retrieved_docs = _rerank(reranker, question, retrieved_docs, top_k=k)
+    else:
+        retrieved_docs = retrieved_docs[:k]
 
     context = "\n\n".join([d.page_content for d in retrieved_docs])
 
@@ -285,16 +428,21 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=N
     answer = llm.invoke(prompt)
     return answer, context
 
-def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, reranker=None):
+def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, reranker=None,
+                     bm25_index=None, bm25_docs=None, use_hyde=False):
     reranker_label = "+ reranker" if reranker else ""
-    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label})...")
+    hybrid_label = "+ hybrid" if bm25_index else ""
+    hyde_label = "+ HyDE" if use_hyde else ""
+    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label} {hybrid_label} {hyde_label})...")
     results = []
 
     for i, case in enumerate(test_cases):
         q = case["question"]
         print(f"  [{i+1}/{len(test_cases)}] {q}")
         try:
-            answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k, reranker=reranker)
+            answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k,
+                                        reranker=reranker, bm25_index=bm25_index, bm25_docs=bm25_docs,
+                                        use_hyde=use_hyde)
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],

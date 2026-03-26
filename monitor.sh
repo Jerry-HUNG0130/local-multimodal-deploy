@@ -1,3 +1,4 @@
+
 #!/bin/bash
 LOG_FILE="/home/jerry/project/hardware_log.csv"
 echo "Timestamp, CPU_Idle(%), RAM_Used(MB), GPU_Util(%), GPU_Mem_Used(MB)" > "$LOG_FILE"

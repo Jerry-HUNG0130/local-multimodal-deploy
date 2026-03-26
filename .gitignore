@@ -10,6 +10,8 @@ __pycache__/
 # 向量資料庫與測試資料
 04_knowledge_engine/vector_db/
 04_knowledge_engine/vector_db_v2/
+04_knowledge_engine/vector_db_v3/
+04_knowledge_engine/vector_db_v4/
 04_knowledge_engine/vector_db_v1_mxbai/
 03_data_simulation/mock_images/
 03_data_simulation/mock_video/
@@ -33,5 +35,4 @@ hardware_log.csv
 # 評估結果
 07_evaluation_results/
 
-# Claude Code
-CLAUDE.md
+# Claude Code（CLAUDE.md 保留追蹤，記錄專案改動歷程）
