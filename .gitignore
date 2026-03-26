@@ -35,4 +35,5 @@ hardware_log.csv
 # 評估結果
 07_evaluation_results/
 
-# Claude Code（CLAUDE.md 保留追蹤，記錄專案改動歷程）
+# Claude Code
+CLAUDE.md
