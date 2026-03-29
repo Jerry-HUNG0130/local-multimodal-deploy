@@ -134,16 +134,33 @@ DB_DIR_MAP = {
     'v4': DB_DIR_V4,
 }
 
+# Embedding 模型對照表
+EMBED_MODEL_MAP = {
+    'bge-m3': 'BAAI/bge-m3',
+    'bge-large-zh': 'BAAI/bge-large-zh-v1.5',
+}
+
+def _get_db_dir(version, embed_model):
+    """根據 version 和 embed_model 決定 vector DB 目錄"""
+    base = DB_DIR_MAP[version]
+    if embed_model != 'bge-m3':
+        # 非預設 embedding 模型，建立獨立目錄
+        base = base + f"_{embed_model.replace('-', '')}"
+    return base
+
 
 def main():
     parser = argparse.ArgumentParser(description="Build RAG vector database")
     parser.add_argument('--version', type=str, default='v2', choices=['v1', 'v2', 'v3', 'v4'],
                         help='v1=RecursiveCharacter(500), v2=MarkdownHeader, v3=MarkdownHeader+標題前綴, v4=NodeParser+標題前綴')
+    parser.add_argument('--embed-model', type=str, default='bge-m3', choices=list(EMBED_MODEL_MAP.keys()),
+                        help='Embedding 模型：bge-m3（預設）, bge-large-zh（BAAI/bge-large-zh-v1.5）')
     args = parser.parse_args()
 
-    db_dir = DB_DIR_MAP[args.version]
+    db_dir = _get_db_dir(args.version, args.embed_model)
+    model_name = EMBED_MODEL_MAP[args.embed_model]
 
-    print(f"🚀 正在讀取公司規章 Markdown 檔案 (version={args.version})...")
+    print(f"🚀 正在讀取公司規章 Markdown 檔案 (version={args.version}, embed={args.embed_model})...")
 
     if args.version == 'v4':
         chunks = load_and_split_markdown_v4(DOCS_DIR)
@@ -169,9 +186,9 @@ def main():
         print(f"  metadata: {c.metadata}")
         print(f"  content:  {c.page_content[:80]}...")
 
-    print(f"\n🧠 啟動 BGE-M3 語義檢索模型 (使用 L4 GPU 加速)...")
+    print(f"\n🧠 啟動 {model_name} 語義檢索模型 (使用 L4 GPU 加速)...")
     embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
+        model_name=model_name,
         model_kwargs={'device': 'cuda'}
     )
 

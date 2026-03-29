@@ -153,19 +153,72 @@ class HardwareMonitor:
 # ============================================================
 # Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
-def init_rag(k=3, db_version='v2'):
+# Embedding 模型對照表
+EMBED_MODEL_MAP = {
+    'bge-m3': 'BAAI/bge-m3',
+    'bge-large-zh': 'BAAI/bge-large-zh-v1.5',
+}
+
+def _get_db_dir(db_version, embed_model='bge-m3'):
+    """根據 db_version 和 embed_model 決定 vector DB 目錄"""
     db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4}
-    db_dir = db_map.get(db_version, DB_DIR_V2)
-    print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version})...")
+    base = db_map.get(db_version, DB_DIR_V2)
+    if embed_model != 'bge-m3':
+        base = base + f"_{embed_model.replace('-', '')}"
+    return base
+
+def init_rag(k=3, db_version='v2', embed_model='bge-m3'):
+    db_dir = _get_db_dir(db_version, embed_model)
+    model_name = EMBED_MODEL_MAP.get(embed_model, 'BAAI/bge-m3')
+    print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version}, embed={embed_model})...")
     embeddings = HuggingFaceEmbeddings(
-        model_name="BAAI/bge-m3",
+        model_name=model_name,
         model_kwargs={'device': 'cuda'}
     )
     vector_db = Chroma(persist_directory=db_dir, embedding_function=embeddings)
     retriever = vector_db.as_retriever(search_kwargs={"k": k})
     llm = Ollama(model="llama3", temperature=0.0)
-    print(f"✅ RAG 引擎就緒 (k={k}, db={db_version})\n")
+    print(f"✅ RAG 引擎就緒 (k={k}, db={db_version}, embed={embed_model})\n")
     return retriever, llm
+
+def _decompose_query(question):
+    """Rule-based 拆分複合問題為多個子查詢（不需要額外 LLM 呼叫）"""
+    import re
+
+    # 不拆分的模式：A還是B 的對比型問題
+    if re.search(r'還是|或是|或者', question):
+        return [question]
+
+    # 用中文問號拆分
+    fragments = re.split(r'？', question)
+    fragments = [f.strip() for f in fragments if f.strip() and len(f.strip()) >= 6]
+
+    if len(fragments) <= 1:
+        return [question]
+
+    # 限制最多 3 個子查詢
+    fragments = fragments[:3]
+
+    # 判斷後續片段是否缺少主語，如果是則補上第一個片段的主題前綴
+    # 提取第一個片段的主題（取到第一個逗號或問題核心之前的部分）
+    first = fragments[0]
+    # 嘗試提取主題前綴：「去外縣市拜訪客戶，每天吃飯...」→「去外縣市拜訪客戶」
+    topic_match = re.match(r'^(.+?)[，,]', first)
+    topic_prefix = topic_match.group(1) if topic_match else ""
+
+    sub_queries = [first + "？"]
+    for frag in fragments[1:]:
+        # 判斷是否以功能詞開頭（缺少主語）
+        if re.match(r'^(有|會|需|能|可|要|如果|沒|是否|多久|什麼|幾|怎)', frag):
+            if topic_prefix:
+                sub_queries.append(topic_prefix + "，" + frag + "？")
+            else:
+                sub_queries.append(frag + "？")
+        else:
+            sub_queries.append(frag + "？")
+
+    return sub_queries
+
 
 def _rewrite_keywords(llm, question):
     """原始策略：將問題轉換為 3~5 個關鍵字"""
@@ -337,67 +390,101 @@ def _hybrid_retrieve(retriever, bm25_index, docs_with_meta, query, fetch_k=9, rr
 
 
 def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=None,
-              bm25_index=None, bm25_docs=None, use_hyde=False):
+              bm25_index=None, bm25_docs=None, use_hyde=False, use_fewshot=False,
+              use_decompose=False):
     # 如果有 reranker，先多撈一些候選文件再重排
     fetch_k = k * 3 if reranker else k
     use_hybrid = bm25_index is not None and bm25_docs is not None
 
-    # --- 根據 rewrite_mode 決定搜尋查詢 ---
-    if rewrite_mode == 'sentence':
-        search_query = _rewrite_sentence(llm, question)
-        print(f"  📝 [sentence] 改寫查詢：{search_query}")
-    elif rewrite_mode == 'dual':
-        search_query = _rewrite_sentence(llm, question)
-        print(f"  📝 [dual] 改寫查詢：{search_query}")
+    # --- Query Decomposition: 複合問題拆分 ---
+    if use_decompose:
+        sub_queries = _decompose_query(question)
     else:
-        search_query = _rewrite_keywords(llm, question)
-        print(f"  📝 [keywords] 擴寫關鍵字：{search_query}")
+        sub_queries = [question]
 
-    # --- HyDE: 產生假設性回答用於 vector search ---
-    hyde_query = None
-    if use_hyde:
-        hyde_query = _hyde_generate(llm, question)
-        print(f"  🔮 [HyDE] 假設性回答：{hyde_query[:80]}...")
+    if use_decompose and len(sub_queries) > 1:
+        print(f"  🔀 [decompose] 拆分為 {len(sub_queries)} 個子查詢：{sub_queries}")
 
-    # --- 檢索 ---
-    if use_hybrid:
-        # Hybrid Search: Vector + BM25 → RRF 合併
-        print(f"  🔀 [hybrid] Vector + BM25 → RRF 合併 (fetch_k={fetch_k})")
-        if rewrite_mode == 'dual':
-            hybrid_docs_1 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, question,
-                                             fetch_k=fetch_k, vector_query=hyde_query)
-            hybrid_docs_2 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
-                                             fetch_k=fetch_k, vector_query=hyde_query)
-            seen = set()
-            retrieved_docs = []
-            for doc in hybrid_docs_1 + hybrid_docs_2:
-                key = doc.page_content.strip()
-                if key not in seen:
-                    seen.add(key)
-                    retrieved_docs.append(doc)
-            retrieved_docs = retrieved_docs[:fetch_k]
+    # --- 對每個子查詢進行 rewrite + 檢索，合併結果 ---
+    all_retrieved_docs = []
+    seen_contents = set()
+
+    for sq in sub_queries:
+        # 根據 rewrite_mode 決定搜尋查詢
+        if rewrite_mode == 'sentence':
+            search_query = _rewrite_sentence(llm, sq)
+            if len(sub_queries) == 1:
+                print(f"  📝 [sentence] 改寫查詢：{search_query}")
+            else:
+                print(f"    📝 [sentence] 子查詢改寫：{search_query}")
+        elif rewrite_mode == 'dual':
+            search_query = _rewrite_sentence(llm, sq)
+            if len(sub_queries) == 1:
+                print(f"  📝 [dual] 改寫查詢：{search_query}")
+            else:
+                print(f"    📝 [dual] 子查詢改寫：{search_query}")
         else:
-            # HyDE: vector search 用假設性回答，BM25 用 sentence rewrite 查詢
-            retrieved_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
-                                             fetch_k=fetch_k, vector_query=hyde_query)
-            if not retrieved_docs:
-                retrieved_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, question,
+            search_query = _rewrite_keywords(llm, sq)
+            if len(sub_queries) == 1:
+                print(f"  📝 [keywords] 擴寫關鍵字：{search_query}")
+            else:
+                print(f"    📝 [keywords] 子查詢關鍵字：{search_query}")
+
+        # HyDE: 產生假設性回答用於 vector search
+        hyde_query = None
+        if use_hyde:
+            hyde_query = _hyde_generate(llm, sq)
+            if len(sub_queries) == 1:
+                print(f"  🔮 [HyDE] 假設性回答：{hyde_query[:80]}...")
+            else:
+                print(f"    🔮 [HyDE] 子查詢假設性回答：{hyde_query[:60]}...")
+
+        # 檢索
+        if use_hybrid:
+            if len(sub_queries) == 1:
+                print(f"  🔀 [hybrid] Vector + BM25 → RRF 合併 (fetch_k={fetch_k})")
+            if rewrite_mode == 'dual':
+                hybrid_docs_1 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, sq,
                                                  fetch_k=fetch_k, vector_query=hyde_query)
-        retrieved_docs = retrieved_docs[:fetch_k]
-    else:
-        # 純 Vector Search（原有邏輯）
-        original_k = retriever.search_kwargs.get("k", k)
-        retriever.search_kwargs["k"] = fetch_k
-
-        vec_q = hyde_query if hyde_query else search_query
-        if rewrite_mode == 'dual':
-            retrieved_docs = _retrieve_with_dedup(retriever, [question, vec_q], fetch_k)
+                hybrid_docs_2 = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
+                                                 fetch_k=fetch_k, vector_query=hyde_query)
+                seen_local = set()
+                sub_docs = []
+                for doc in hybrid_docs_1 + hybrid_docs_2:
+                    key = doc.page_content.strip()
+                    if key not in seen_local:
+                        seen_local.add(key)
+                        sub_docs.append(doc)
+                sub_docs = sub_docs[:fetch_k]
+            else:
+                sub_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, search_query,
+                                            fetch_k=fetch_k, vector_query=hyde_query)
+                if not sub_docs:
+                    sub_docs = _hybrid_retrieve(retriever, bm25_index, bm25_docs, sq,
+                                                fetch_k=fetch_k, vector_query=hyde_query)
+            sub_docs = sub_docs[:fetch_k]
         else:
-            retrieved_docs = retriever.invoke(vec_q)
-            if not retrieved_docs:
-                retrieved_docs = retriever.invoke(question)
+            original_k = retriever.search_kwargs.get("k", k)
+            retriever.search_kwargs["k"] = fetch_k
 
-        retriever.search_kwargs["k"] = original_k
+            vec_q = hyde_query if hyde_query else search_query
+            if rewrite_mode == 'dual':
+                sub_docs = _retrieve_with_dedup(retriever, [sq, vec_q], fetch_k)
+            else:
+                sub_docs = retriever.invoke(vec_q)
+                if not sub_docs:
+                    sub_docs = retriever.invoke(sq)
+
+            retriever.search_kwargs["k"] = original_k
+
+        # 合併去重
+        for doc in sub_docs:
+            key = doc.page_content.strip()
+            if key not in seen_contents:
+                seen_contents.add(key)
+                all_retrieved_docs.append(doc)
+
+    retrieved_docs = all_retrieved_docs
 
     # --- Reranker 重排（如果有提供）---
     if reranker is not None:
@@ -408,7 +495,43 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=N
 
     context = "\n\n".join([d.page_content for d in retrieved_docs])
 
-    prompt = f"""你是公司內部規章查詢系統。
+    if use_fewshot:
+        prompt = f"""你是公司內部規章查詢系統。
+
+【回答規則】
+1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
+2. 回答必須簡潔扼要，直接給出答案，不要加客套話或問候語。
+3. 只有當參考資料中「完全沒有」任何相關內容時，才回答「規章未說明」。
+4. 嚴禁添加參考資料中沒有提到的內容，不要自行編造數字或規定。
+5. 回答必須使用繁體中文。
+
+以下是三個回答範例，請嚴格參照此格式與風格作答：
+
+【範例一】
+參考資料：【採購與固定資產管理作業程序 > 第二章 採購流程與核准權限 > 第 4 條 簽核權責】採購金額 > 200,000 元：一律須呈報總經理（CEO）核准。
+員工提問：採購二十五萬的設備需要誰簽核？
+回答：根據採購作業程序第4條，採購金額超過200,000元須呈報總經理（CEO）核准。
+
+【範例二】
+參考資料：【員工請假管理辦法 > 第二章 假別規定 > 第 3 條 事假】事假應於三日前提出申請，每年以 14 日為限。
+員工提問：員工可以帶寵物上班嗎？
+回答：規章未說明。參考資料中僅涉及請假規定，未提及攜帶寵物之相關規範。
+
+【範例三】
+參考資料：【工時與考勤管理制度 > 第二章 出勤打卡與異常處理 > 第 4 條 遲到、早退與緩衝期機制】打卡時間超過 09:31 且未達 10:00 者視為遲到，當日薪資將直接扣發半小時之基準時薪。每月系統提供給所有員工「2 次、每次 5 分鐘內」之容錯寬限期。自第 3 次微幅遲到起，將嚴格執行前項遲到扣薪規定。
+員工提問：這個月已經遲到兩次了，下次遲到會怎樣？
+回答：根據工時與考勤管理制度第4條，每月有2次、每次5分鐘內的寬限期。自第3次微幅遲到起將嚴格執行扣薪規定，超過09:31即扣發半小時基準時薪。
+
+【參考資料】
+{context}
+
+【員工提問】
+{question}
+
+【你的回答】
+"""
+    else:
+        prompt = f"""你是公司內部規章查詢系統。
 
 【回答規則】
 1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
@@ -429,11 +552,14 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=N
     return answer, context
 
 def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, reranker=None,
-                     bm25_index=None, bm25_docs=None, use_hyde=False):
+                     bm25_index=None, bm25_docs=None, use_hyde=False, use_fewshot=False,
+                     use_decompose=False):
     reranker_label = "+ reranker" if reranker else ""
     hybrid_label = "+ hybrid" if bm25_index else ""
     hyde_label = "+ HyDE" if use_hyde else ""
-    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label} {hybrid_label} {hyde_label})...")
+    fewshot_label = "+ few-shot" if use_fewshot else ""
+    decompose_label = "+ decompose" if use_decompose else ""
+    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label} {hybrid_label} {hyde_label} {fewshot_label} {decompose_label})...")
     results = []
 
     for i, case in enumerate(test_cases):
@@ -442,7 +568,8 @@ def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, r
         try:
             answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k,
                                         reranker=reranker, bm25_index=bm25_index, bm25_docs=bm25_docs,
-                                        use_hyde=use_hyde)
+                                        use_hyde=use_hyde, use_fewshot=use_fewshot,
+                                        use_decompose=use_decompose)
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],
