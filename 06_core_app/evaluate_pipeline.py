@@ -153,18 +153,18 @@ class HardwareMonitor:
 # ============================================================
 # Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
-def init_rag(k=3, db_version='v2'):
+def init_rag(k=3, db_version='v2', llm_model='llama3'):
     db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4}
     db_dir = db_map.get(db_version, DB_DIR_V2)
-    print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version})...")
+    print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version}, llm={llm_model})...")
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
         model_kwargs={'device': 'cuda'}
     )
     vector_db = Chroma(persist_directory=db_dir, embedding_function=embeddings)
     retriever = vector_db.as_retriever(search_kwargs={"k": k})
-    llm = Ollama(model="llama3", temperature=0.0)
-    print(f"✅ RAG 引擎就緒 (k={k}, db={db_version})\n")
+    llm = Ollama(model=llm_model, temperature=0.0)
+    print(f"✅ RAG 引擎就緒 (k={k}, db={db_version}, llm={llm_model})\n")
     return retriever, llm
 
 def _rewrite_keywords(llm, question):
