@@ -3,8 +3,10 @@
 __pycache__/
 *.pyc
 
-# 機器學習模型 (YOLO 等)
+# 機器學習模型
 02_models/yolo/*.pt
+02_models/*.gguf
+02_models/Llama-3.1-Taiwan-8B-Instruct/
 *.onnx
 
 # 向量資料庫與測試資料
