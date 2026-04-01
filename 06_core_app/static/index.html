@@ -5,6 +5,22 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0">
     <title>機房與人資知識庫 (Secure RAG AI)</title>
     <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;500;600&display=swap" rel="stylesheet">
+    <script>
+    // 輕量 Markdown 渲染（不依賴外部 CDN）
+    function renderMarkdown(text) {
+        return text
+            .replace(/\*\*(.+?)\*\*/g, '<strong>$1</strong>')
+            .replace(/`([^`]+)`/g, '<code>$1</code>')
+            .replace(/^### (.+)$/gm, '<h4>$1</h4>')
+            .replace(/^## (.+)$/gm, '<h3>$1</h3>')
+            .replace(/^# (.+)$/gm, '<h2>$1</h2>')
+            .replace(/^\d+\.\s+(.+)$/gm, '<li>$1</li>')
+            .replace(/^[-*]\s+(.+)$/gm, '<li>$1</li>')
+            .replace(/(<li>.*<\/li>\n?)+/gs, '<ul>$&</ul>')
+            .replace(/\n{2,}/g, '<br><br>')
+            .replace(/\n/g, '<br>');
+    }
+    </script>
     <style>
         :root {
             --bg-deep: #020617;
@@ -151,6 +167,16 @@
             display: none;
         }
 
+        /* Markdown 渲染樣式 */
+        .ai-message p { margin: 0.4em 0; }
+        .ai-message strong { color: #93c5fd; }
+        .ai-message code { background: rgba(255,255,255,0.1); padding: 2px 6px; border-radius: 4px; font-size: 0.9em; }
+        .ai-message ul, .ai-message ol { padding-left: 1.5em; margin: 0.4em 0; }
+        .ai-message li { margin: 0.2em 0; }
+        .context-box p { margin: 0.3em 0; }
+        .context-box strong { color: #c4b5fd; }
+        .context-box code { background: rgba(255,255,255,0.08); padding: 1px 4px; border-radius: 3px; }
+
         .input-section {
             padding: 24px 32px;
             background: rgba(15, 23, 42, 0.5);
@@ -270,16 +296,19 @@
         const msgDiv = document.createElement('div');
         msgDiv.className = `message ${sender}-message`;
         
-        // 將換行符號轉成 <br>
-        let formattedText = text.replace(/\n/g, '<br>');
-        msgDiv.innerHTML = formattedText;
+        // Markdown 渲染（AI 回答）或純文字（使用者）
+        if (sender === 'ai') {
+            msgDiv.innerHTML = renderMarkdown(text);
+        } else {
+            msgDiv.innerHTML = text.replace(/\n/g, '<br>');
+        }
 
         // 如果是 AI 回答且有參考資料，附加上去
         if (context && context.trim() !== '') {
             const ctxDiv = document.createElement('div');
             ctxDiv.className = 'context-box';
             ctxDiv.style.display = 'block';
-            ctxDiv.innerHTML = `<strong>來自內部資料庫的參考依據：</strong><br>${context.replace(/\n/g, '<br>')}`;
+            ctxDiv.innerHTML = `<strong>來自內部資料庫的參考依據：</strong><br>` + renderMarkdown(context);
             msgDiv.appendChild(ctxDiv);
         }
 

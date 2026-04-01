@@ -39,6 +39,7 @@ DB_DIR_V1 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine",
 DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v2")
 DB_DIR_V3 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v3")
 DB_DIR_V4 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v4")
+DB_DIR_V5 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v5")
 DATASET_FILE = "golden_dataset.json"
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "scores")
 HARDWARE_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "hardware")
@@ -154,7 +155,7 @@ class HardwareMonitor:
 # Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
 def init_rag(k=3, db_version='v2', llm_model='llama3'):
-    db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4}
+    db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4, 'v5': DB_DIR_V5}
     db_dir = db_map.get(db_version, DB_DIR_V2)
     print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version}, llm={llm_model})...")
     embeddings = HuggingFaceEmbeddings(
@@ -166,6 +167,43 @@ def init_rag(k=3, db_version='v2', llm_model='llama3'):
     llm = Ollama(model=llm_model, temperature=0.0)
     print(f"✅ RAG 引擎就緒 (k={k}, db={db_version}, llm={llm_model})\n")
     return retriever, llm
+
+def _decompose_query(question):
+    """Rule-based 拆分複合問題為多個子查詢（不需要額外 LLM 呼叫）"""
+    import re
+
+    # 不拆分的模式：A還是B 的對比型問題
+    if re.search(r'還是|或是|或者', question):
+        return [question]
+
+    # 用中文問號拆分
+    fragments = re.split(r'？', question)
+    fragments = [f.strip() for f in fragments if f.strip() and len(f.strip()) >= 6]
+
+    if len(fragments) <= 1:
+        return [question]
+
+    # 限制最多 3 個子查詢
+    fragments = fragments[:3]
+
+    # 提取第一個片段的主題前綴
+    first = fragments[0]
+    topic_match = re.match(r'^(.+?)[，,]', first)
+    topic_prefix = topic_match.group(1) if topic_match else ""
+
+    sub_queries = [first + "？"]
+    for frag in fragments[1:]:
+        # 判斷是否以功能詞開頭（缺少主語）
+        if re.match(r'^(有|會|需|能|可|要|如果|沒|是否|多久|什麼|幾|怎)', frag):
+            if topic_prefix:
+                sub_queries.append(topic_prefix + "，" + frag + "？")
+            else:
+                sub_queries.append(frag + "？")
+        else:
+            sub_queries.append(frag + "？")
+
+    return sub_queries
+
 
 def _rewrite_keywords(llm, question):
     """原始策略：將問題轉換為 3~5 個關鍵字"""
@@ -337,9 +375,45 @@ def _hybrid_retrieve(retriever, bm25_index, docs_with_meta, query, fetch_k=9, rr
 
 
 def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=None,
-              bm25_index=None, bm25_docs=None, use_hyde=False):
+              bm25_index=None, bm25_docs=None, use_hyde=False, use_decompose=False,
+              prompt_version='v1', fetch_k_override=None):
+    # --- Query Decomposition：複合問題拆分後各自檢索再合併 ---
+    if use_decompose:
+        sub_queries = _decompose_query(question)
+        if len(sub_queries) > 1:
+            print(f"  🔀 [decompose] 拆分為 {len(sub_queries)} 個子查詢")
+            all_docs = []
+            seen = set()
+            for sq in sub_queries:
+                print(f"    ↳ 子查詢：{sq}")
+                _, sub_context = rag_query(retriever, llm, sq, rewrite_mode=rewrite_mode, k=k,
+                                           reranker=None, bm25_index=bm25_index, bm25_docs=bm25_docs,
+                                           use_hyde=use_hyde, use_decompose=False)
+                # 收集不重複的 docs
+                for doc_text in sub_context.split("\n\n"):
+                    key = doc_text.strip()
+                    if key and key not in seen:
+                        seen.add(key)
+                        from langchain_core.documents import Document
+                        all_docs.append(Document(page_content=key))
+
+            # 用 reranker 從所有子查詢結果中精選 top k
+            if reranker is not None and all_docs:
+                print(f"  🔄 [reranker] 合併重排 {len(all_docs)} → top {k}")
+                all_docs = _rerank(reranker, question, all_docs, top_k=k)
+            else:
+                all_docs = all_docs[:k]
+
+            context = "\n\n".join([d.page_content for d in all_docs])
+            prompt = _build_generation_prompt(context, question)
+            answer = llm.invoke(prompt)
+            return answer, context
+
     # 如果有 reranker，先多撈一些候選文件再重排
-    fetch_k = k * 3 if reranker else k
+    if fetch_k_override is not None:
+        fetch_k = fetch_k_override
+    else:
+        fetch_k = k * 3 if reranker else k
     use_hybrid = bm25_index is not None and bm25_docs is not None
 
     # --- 根據 rewrite_mode 決定搜尋查詢 ---
@@ -408,7 +482,67 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=N
 
     context = "\n\n".join([d.page_content for d in retrieved_docs])
 
-    prompt = f"""你是公司內部規章查詢系統。
+    prompt = _build_generation_prompt(context, question, version=prompt_version)
+    answer = llm.invoke(prompt)
+    return answer, context
+
+
+def _build_generation_prompt(context, question, version='v1'):
+    """建構生成回答的 prompt。version='v1' 為原始版本，'v2' 為 Qwen2.5 優化版。"""
+    if version == 'v3':
+        return f"""你是公司內部規章查詢系統。
+
+【回答規則】
+1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
+2. 回答必須簡潔扼要，直接給出答案，不要加客套話或問候語。
+3. 只有當參考資料中「完全沒有」任何相關內容時，才回答「規章未說明」。
+4. 嚴禁添加參考資料中沒有提到的內容，不要自行編造數字或規定。
+5. 回答必須使用繁體中文。
+
+【範例一】正確引用條文：
+參考資料提到「採購金額 > 200,000 元：一律須呈報總經理（CEO）核准」
+員工提問：買一台 25 萬的 GPU，要簽核到哪個層級？
+正確回答：採購金額超過 200,000 元，須呈報總經理（CEO）核准。
+
+【範例二】注意排除條款：
+參考資料提到「1. 全職工程師皆具備申請資格。2. 第一線機房維運者不得申請。」
+員工提問：我是機房 SRE，可以申請嗎？
+正確回答：不行。第一線機房維運者因工作性質，不得申請。
+
+【範例三】規章未涵蓋時：
+參考資料僅提到加班費與補休轉換規定。
+員工提問：春節加班費是幾倍？
+正確回答：規章未說明。
+
+【參考資料】
+{context}
+
+【員工提問】
+{question}
+
+【你的回答】
+"""
+    elif version == 'v2':
+        return f"""你是公司內部規章查詢系統，專門回答員工關於公司規章制度的問題。
+
+【回答規則】
+1. 仔細閱讀下方【參考資料】的每一條規定，包含所有子項目、例外條款和排除對象，不要只看第一項就下結論。
+2. 即使參考資料的用語與員工提問不完全相同，只要內容相關就應引用作答。
+3. 回答必須簡潔扼要，直接給出答案，不要加客套話。
+4. 只有當參考資料中「完全沒有」任何相關內容時，才回答「規章未說明」。
+5. 嚴禁添加參考資料中沒有提到的內容，不要自行編造數字或規定。
+6. 所有輸出必須使用繁體中文，禁止使用簡體中文。
+
+【參考資料】
+{context}
+
+【員工提問】
+{question}
+
+【你的回答】
+"""
+    else:
+        return f"""你是公司內部規章查詢系統。
 
 【回答規則】
 1. 仔細閱讀下方【參考資料】，從中找出與問題相關的條文，直接引用作答。
@@ -425,15 +559,16 @@ def rag_query(retriever, llm, question, rewrite_mode='keywords', k=3, reranker=N
 
 【你的回答】
 """
-    answer = llm.invoke(prompt)
-    return answer, context
 
 def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, reranker=None,
-                     bm25_index=None, bm25_docs=None, use_hyde=False):
+                     bm25_index=None, bm25_docs=None, use_hyde=False, use_decompose=False,
+                     prompt_version='v1', fetch_k_override=None):
     reranker_label = "+ reranker" if reranker else ""
     hybrid_label = "+ hybrid" if bm25_index else ""
     hyde_label = "+ HyDE" if use_hyde else ""
-    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label} {hybrid_label} {hyde_label})...")
+    decompose_label = "+ decompose" if use_decompose else ""
+    prompt_label = f"+ prompt-{prompt_version}" if prompt_version != 'v1' else ""
+    print(f"🤖 Step 1: 正在讓本地 RAG 模型進行作答 (rewrite={rewrite_mode} {reranker_label} {hybrid_label} {hyde_label} {decompose_label} {prompt_label})...")
     results = []
 
     for i, case in enumerate(test_cases):
@@ -442,7 +577,8 @@ def generate_answers(test_cases, retriever, llm, rewrite_mode='keywords', k=3, r
         try:
             answer, context = rag_query(retriever, llm, q, rewrite_mode=rewrite_mode, k=k,
                                         reranker=reranker, bm25_index=bm25_index, bm25_docs=bm25_docs,
-                                        use_hyde=use_hyde)
+                                        use_hyde=use_hyde, use_decompose=use_decompose,
+                                        prompt_version=prompt_version, fetch_k_override=fetch_k_override)
             results.append({
                 "question": q,
                 "ground_truth": case["ground_truth"],

@@ -16,6 +16,8 @@ DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "vector_db_v2")
 DB_DIR_V3 = os.path.join(os.path.dirname(__file__), "vector_db_v3")
 # v4: MarkdownNodeParser + 標題前綴
 DB_DIR_V4 = os.path.join(os.path.dirname(__file__), "vector_db_v4")
+# v5: MarkdownHeaderTextSplitter + 標題前綴 + Contextual Retrieval (LLM 語義前綴)
+DB_DIR_V5 = os.path.join(os.path.dirname(__file__), "vector_db_v5")
 
 HEADERS_TO_SPLIT_ON = [
     ("#",   "document_title"),
@@ -127,25 +129,85 @@ def load_and_split_markdown_v4(docs_dir):
     return all_chunks
 
 
+def load_and_split_markdown_v5(docs_dir, llm_model='qwen2.5:7b-instruct-q8_0'):
+    """v5: v3 基礎 + Contextual Retrieval（用 LLM 為每個 chunk 產生語義定位說明）
+
+    Anthropic Contextual Retrieval 方法：
+    將整份文件作為 context，讓 LLM 為每個 chunk 生成一段簡短的定位描述，
+    說明此 chunk 在文件中的角色和關聯，拼接到 chunk 前面後再 embedding。
+    """
+    from langchain_community.llms import Ollama
+
+    # 先用 v3 的方式切分（含標題前綴）
+    chunks = load_and_split_markdown_v3(docs_dir)
+
+    # 讀取完整文件內容（以 source_file 分組）
+    full_docs = {}
+    for file_path in sorted(glob.glob(os.path.join(docs_dir, "*.md"))):
+        filename = os.path.basename(file_path)
+        with open(file_path, "r", encoding="utf-8") as f:
+            full_docs[filename] = f.read()
+
+    llm = Ollama(model=llm_model, temperature=0.0)
+    print(f"\n🧠 Contextual Retrieval: 使用 {llm_model} 為 {len(chunks)} 個 chunks 生成語義前綴...")
+
+    for i, chunk in enumerate(chunks):
+        source_file = chunk.metadata.get("source_file", "")
+        full_doc = full_docs.get(source_file, "")
+
+        # 截取 chunk 的純文本（去掉 v3 的標題前綴）
+        chunk_text = chunk.page_content
+
+        prompt = (
+            "<document>\n"
+            f"{full_doc}\n"
+            "</document>\n\n"
+            "以下是上述文件中的一個片段：\n"
+            "<chunk>\n"
+            f"{chunk_text}\n"
+            "</chunk>\n\n"
+            "請用 1-2 句繁體中文，簡要說明這個片段在整份文件中的定位與用途。"
+            "直接輸出說明，不要加前綴或解釋。"
+        )
+        try:
+            context_desc = llm.invoke(prompt).strip()
+            # 清洗：移除可能的前綴
+            for prefix in ["說明：", "定位：", "這個片段"]:
+                if context_desc.startswith(prefix):
+                    context_desc = context_desc[len(prefix):].strip()
+            # 將語義描述加到 chunk 最前面
+            chunk.page_content = f"[語義定位] {context_desc}\n{chunk.page_content}"
+            print(f"  [{i+1}/{len(chunks)}] ✅ {context_desc[:60]}...")
+        except Exception as e:
+            print(f"  [{i+1}/{len(chunks)}] ❌ LLM 呼叫失敗: {e}")
+
+    return chunks
+
+
 DB_DIR_MAP = {
     'v1': DB_DIR_V1,
     'v2': DB_DIR_V2,
     'v3': DB_DIR_V3,
     'v4': DB_DIR_V4,
+    'v5': DB_DIR_V5,
 }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build RAG vector database")
-    parser.add_argument('--version', type=str, default='v2', choices=['v1', 'v2', 'v3', 'v4'],
-                        help='v1=RecursiveCharacter(500), v2=MarkdownHeader, v3=MarkdownHeader+標題前綴, v4=NodeParser+標題前綴')
+    parser.add_argument('--version', type=str, default='v2', choices=['v1', 'v2', 'v3', 'v4', 'v5'],
+                        help='v1=RecursiveCharacter(500), v2=MarkdownHeader, v3=MarkdownHeader+標題前綴, v4=NodeParser+標題前綴, v5=v3+Contextual Retrieval')
+    parser.add_argument('--llm-model', type=str, default='qwen2.5:7b-instruct-q8_0',
+                        help='LLM model for contextual retrieval (v5 only)')
     args = parser.parse_args()
 
     db_dir = DB_DIR_MAP[args.version]
 
     print(f"🚀 正在讀取公司規章 Markdown 檔案 (version={args.version})...")
 
-    if args.version == 'v4':
+    if args.version == 'v5':
+        chunks = load_and_split_markdown_v5(DOCS_DIR, llm_model=args.llm_model)
+    elif args.version == 'v4':
         chunks = load_and_split_markdown_v4(DOCS_DIR)
     elif args.version == 'v3':
         chunks = load_and_split_markdown_v3(DOCS_DIR)

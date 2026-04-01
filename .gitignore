@@ -33,7 +33,7 @@ hardware_log.csv
 *.otf
 *.json
 *.png
-
+*.jpg
 # 評估結果
 07_evaluation_results/
 
