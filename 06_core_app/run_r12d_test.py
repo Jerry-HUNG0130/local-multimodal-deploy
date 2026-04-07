@@ -21,10 +21,10 @@ DATASET_FILE = os.path.join(os.path.dirname(os.path.abspath(__file__)), "golden_
 
 
 def run_test():
-    run_label = "R12d_dbv3_k3_rw-sentence_hyde_hybrid-bm25_reranker_fewshot_qwen25"
+    run_label = "R12d_dbv3_k3_rw-sentence_hyde_hybrid-bm25_reranker_fewshot_qwen25-q4km_v100"
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     db_version = "v3"
-    llm_model = "qwen2.5:7b-instruct-q8_0"
+    llm_model = "qwen2.5:7b-instruct-q4_K_M"
 
     print("=" * 60)
     print(f"  Round 12d: Qwen2.5 + Few-Shot Prompt v3")
