@@ -18,6 +18,8 @@ DB_DIR_V3 = os.path.join(os.path.dirname(__file__), "vector_db_v3")
 DB_DIR_V4 = os.path.join(os.path.dirname(__file__), "vector_db_v4")
 # v5: MarkdownHeaderTextSplitter + 標題前綴 + Contextual Retrieval (LLM 語義前綴)
 DB_DIR_V5 = os.path.join(os.path.dirname(__file__), "vector_db_v5")
+# v3cpu: 同 v3 但用 CPU embedding（V100 16GB 專用）
+DB_DIR_V3CPU = os.path.join(os.path.dirname(__file__), "vector_db_v3_cpu")
 
 HEADERS_TO_SPLIT_ON = [
     ("#",   "document_title"),
@@ -190,13 +192,14 @@ DB_DIR_MAP = {
     'v3': DB_DIR_V3,
     'v4': DB_DIR_V4,
     'v5': DB_DIR_V5,
+    'v3cpu': DB_DIR_V3CPU,
 }
 
 
 def main():
     parser = argparse.ArgumentParser(description="Build RAG vector database")
-    parser.add_argument('--version', type=str, default='v2', choices=['v1', 'v2', 'v3', 'v4', 'v5'],
-                        help='v1=RecursiveCharacter(500), v2=MarkdownHeader, v3=MarkdownHeader+標題前綴, v4=NodeParser+標題前綴, v5=v3+Contextual Retrieval')
+    parser.add_argument('--version', type=str, default='v2', choices=['v1', 'v2', 'v3', 'v4', 'v5', 'v3cpu'],
+                        help='v1=RecursiveCharacter(500), v2=MarkdownHeader, v3=MarkdownHeader+標題前綴, v4=NodeParser+標題前綴, v5=v3+Contextual Retrieval, v3cpu=v3+CPU embedding')
     parser.add_argument('--llm-model', type=str, default='qwen2.5:7b-instruct-q8_0',
                         help='LLM model for contextual retrieval (v5 only)')
     args = parser.parse_args()
@@ -205,7 +208,9 @@ def main():
 
     print(f"🚀 正在讀取公司規章 Markdown 檔案 (version={args.version})...")
 
-    if args.version == 'v5':
+    if args.version == 'v3cpu':
+        chunks = load_and_split_markdown_v3(DOCS_DIR)
+    elif args.version == 'v5':
         chunks = load_and_split_markdown_v5(DOCS_DIR, llm_model=args.llm_model)
     elif args.version == 'v4':
         chunks = load_and_split_markdown_v4(DOCS_DIR)
@@ -231,10 +236,11 @@ def main():
         print(f"  metadata: {c.metadata}")
         print(f"  content:  {c.page_content[:80]}...")
 
-    print(f"\n🧠 啟動 BGE-M3 語義檢索模型 (使用 L4 GPU 加速)...")
+    embed_device = 'cpu' if args.version == 'v3cpu' else 'cuda'
+    print(f"\n🧠 啟動 BGE-M3 語義檢索模型 (device={embed_device})...")
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
-        model_kwargs={'device': 'cuda'}
+        model_kwargs={'device': embed_device}
     )
 
     print(f"💾 正在轉換並儲存至 ChromaDB ({db_dir})...")

@@ -40,6 +40,7 @@ DB_DIR_V2 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine",
 DB_DIR_V3 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v3")
 DB_DIR_V4 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v4")
 DB_DIR_V5 = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v5")
+DB_DIR_V3CPU = os.path.join(os.path.dirname(__file__), "..", "04_knowledge_engine", "vector_db_v3_cpu")
 DATASET_FILE = "golden_dataset.json"
 RESULTS_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "scores")
 HARDWARE_DIR = os.path.join(os.path.dirname(__file__), "..", "07_evaluation_results", "hardware")
@@ -155,12 +156,12 @@ class HardwareMonitor:
 # Step 1: Generate Answers from Local RAG (Direct Call)
 # ============================================================
 def init_rag(k=3, db_version='v2', llm_model='llama3'):
-    db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4, 'v5': DB_DIR_V5}
+    db_map = {'v1': DB_DIR_V1, 'v2': DB_DIR_V2, 'v3': DB_DIR_V3, 'v4': DB_DIR_V4, 'v5': DB_DIR_V5, 'v3cpu': DB_DIR_V3CPU}
     db_dir = db_map.get(db_version, DB_DIR_V2)
     print(f"📦 正在載入本地 RAG 引擎 (k={k}, db={db_version}, llm={llm_model})...")
     embeddings = HuggingFaceEmbeddings(
         model_name="BAAI/bge-m3",
-        model_kwargs={'device': 'cuda'}
+        model_kwargs={'device': 'cpu'}
     )
     vector_db = Chroma(persist_directory=db_dir, embedding_function=embeddings)
     retriever = vector_db.as_retriever(search_kwargs={"k": k})
